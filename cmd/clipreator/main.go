@@ -5,22 +5,54 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Verifieddanny/clipreator-cli/internal/analyzer"
 	"github.com/Verifieddanny/clipreator-cli/internal/captioner"
 	"github.com/Verifieddanny/clipreator-cli/internal/cutter"
-
+	"github.com/Verifieddanny/clipreator-cli/internal/reframer"
 	"github.com/Verifieddanny/clipreator-cli/internal/transcriber"
 )
 
 func main() {
 	var url string
+	var reframeEnabled bool
+	var noReframe bool
+	var reframeMode string
+	var reframeWidth int
+	var reframeHeight int
+	var reframeSmoothing float64
+	var ollamaModel string
+
 	flag.StringVar(&url, "url", "", "YouTube URL to process")
+	flag.BoolVar(&reframeEnabled, "reframe", true, "enable smart 9:16 face-tracked reframing (default true)")
+	flag.BoolVar(&noReframe, "no-reframe", false, "disable smart reframing and use a static center crop")
+	flag.StringVar(&reframeMode, "reframe-mode", "auto", "reframe mode: auto (face tracking) or center")
+	flag.IntVar(&reframeWidth, "reframe-width", 1080, "vertical output width")
+	flag.IntVar(&reframeHeight, "reframe-height", 1920, "vertical output height")
+	flag.Float64Var(&reframeSmoothing, "reframe-smoothing", 0.03, "camera refocus band as a fraction of frame width (larger = calmer)")
+	flag.StringVar(&ollamaModel, "ollama-model", "", "Ollama model name (defaults to qwen2.5:latest)")
 	flag.Parse()
 
 	if url == "" {
 		fmt.Println("URL is required")
 		os.Exit(1)
+	}
+
+	if ollamaModel != "" {
+		os.Setenv("OLLAMA_MODEL", ollamaModel)
+	}
+
+	if noReframe || os.Getenv("CLIPREATOR_REFRAME") == "0" {
+		reframeEnabled = false
+	}
+	reframeMode = strings.ToLower(strings.TrimSpace(reframeMode))
+	if reframeMode != "auto" && reframeMode != "center" {
+		fmt.Println("reframe-mode must be auto or center")
+		os.Exit(1)
+	}
+	if !reframeEnabled {
+		reframeMode = "center"
 	}
 
 	workDir := ".clipreator_tmp"
@@ -87,7 +119,26 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Update references from clipPaths to results
+	fmt.Println("\n📱 Reframes to 9:16...")
+	reframeOpts := reframer.DefaultOptions()
+	reframeOpts.Mode = reframeMode
+	reframeOpts.Width = reframeWidth
+	reframeOpts.Height = reframeHeight
+	reframeOpts.RefocusBand = reframeSmoothing
+	reframeOpts.WorkDir = workDir
+	for i, clipResult := range clipPaths {
+		label := "smart face tracking"
+		if reframeMode == "center" {
+			label = "center crop"
+		}
+		fmt.Printf("  🎥 Clip %d (%s)...\n", i+1, label)
+		if err := reframer.Reframe(clipResult.Path, reframeOpts); err != nil {
+			fmt.Printf("    ⚠️  Reframe failed: %v\n", err)
+			continue
+		}
+		fmt.Printf("    ✅ %dx%d ready\n", reframeWidth, reframeHeight)
+	}
+
 	fmt.Println("\n💬 Adding captions...")
 	clipsDir := filepath.Join(workDir, "clips")
 	var finalPaths []string
@@ -103,7 +154,6 @@ func main() {
 			continue
 		}
 
-		// Remap timestamps to account for silence removal
 		words = captioner.RemapWords(words, clipResult.KeptSegments)
 		fmt.Printf("    📝 %d words synced to edited timeline\n", len(words))
 

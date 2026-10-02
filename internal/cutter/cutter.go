@@ -205,17 +205,16 @@ func CutClips(videoPath, outputDir string, clips []analyzer.Clip) ([]ClipResult,
 		outputPath := filepath.Join(clipsDir, fmt.Sprintf("clip_%d.mp4", i+1))
 
 		if len(keepSegments) == 1 && len(silentParts) == 0 {
-			fmt.Printf("    📱 Cropping to 9:16 vertical...\n")
+			fmt.Printf("    📦 Extracting source segment (original framing)...\n")
 			cmd = exec.Command("ffmpeg", "-y",
 				"-i", rawPath,
-				"-vf", "crop=ih*9/16:ih,scale=1080:1920",
-				"-c:v", "libx264", "-preset", "fast", "-crf", "23",
-				"-c:a", "aac", "-b:a", "128k",
+				"-c", "copy",
+				"-movflags", "+faststart",
 				outputPath,
 			)
 			cmd.Stderr = nil
 			if err := cmd.Run(); err != nil {
-				fmt.Printf("    ⚠️  Crop failed: %v\n", err)
+				fmt.Printf("    ⚠️  Extract failed: %v\n", err)
 				continue
 			}
 		} else {
@@ -234,8 +233,7 @@ func CutClips(videoPath, outputDir string, clips []analyzer.Clip) ([]ClipResult,
 					"-ss", fmt.Sprintf("%.3f", seg.Start),
 					"-i", rawPath,
 					"-t", fmt.Sprintf("%.3f", segDur),
-					"-vf", "crop=ih*9/16:ih,scale=1080:1920",
-					"-c:v", "libx264", "-preset", "fast", "-crf", "23",
+					"-c:v", "libx264", "-preset", "fast", "-crf", "18",
 					"-c:a", "aac", "-b:a", "128k",
 					"-avoid_negative_ts", "make_zero",
 					segPath,
@@ -259,7 +257,7 @@ func CutClips(videoPath, outputDir string, clips []analyzer.Clip) ([]ClipResult,
 			}
 			os.WriteFile(concatPath, []byte(concatContent.String()), 0644)
 
-			fmt.Printf("    📱 Cropping to 9:16 + removing dead space...\n")
+			fmt.Printf("    📦 Concatenating kept segments (dead space removed)...\n")
 			cmd = exec.Command("ffmpeg", "-y",
 				"-f", "concat", "-safe", "0",
 				"-i", concatPath,
@@ -285,4 +283,36 @@ func CutClips(videoPath, outputDir string, clips []analyzer.Clip) ([]ClipResult,
 	}
 
 	return results, nil
+}
+
+// CenterCropVertical applies Clipreator's original static 9:16 crop.
+func CenterCropVertical(inputPath, outputPath string, width, height int) error {
+	if width <= 0 {
+		width = 1080
+	}
+	if height <= 0 {
+		height = 1920
+	}
+	cmd := exec.Command("ffmpeg", "-y",
+		"-i", inputPath,
+		"-vf", fmt.Sprintf("crop=ih*9/16:ih,scale=%d:%d", width, height),
+		"-c:v", "libx264", "-preset", "fast", "-crf", "23",
+		"-c:a", "copy",
+		"-movflags", "+faststart",
+		outputPath,
+	)
+	cmd.Stderr = nil
+	if err := cmd.Run(); err != nil {
+		cmd = exec.Command("ffmpeg", "-y",
+			"-i", inputPath,
+			"-vf", fmt.Sprintf("crop=ih*9/16:ih,scale=%d:%d", width, height),
+			"-c:v", "libx264", "-preset", "fast", "-crf", "23",
+			"-c:a", "aac", "-b:a", "128k",
+			"-movflags", "+faststart",
+			outputPath,
+		)
+		cmd.Stderr = nil
+		return cmd.Run()
+	}
+	return nil
 }

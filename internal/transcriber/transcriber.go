@@ -46,9 +46,13 @@ func DownloadAudio(url, outputDir string) (string, error) {
 }
 
 func Transcribe(audioPath, outputDir string) (*Transcript, error) {
+	model := os.Getenv("WHISPER_MODEL")
+	if model == "" {
+		model = "base"
+	}
 	cmd := exec.Command("whisper",
 		audioPath,
-		"--model", "base",
+		"--model", model,
 		"--output_format", "json",
 		"--output_dir", outputDir,
 		"--word_timestamps", "True",

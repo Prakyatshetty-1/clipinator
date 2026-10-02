@@ -28,9 +28,8 @@ func Analyze(transcript *transcriber.Transcript) (*AnalysisResult, error) {
 	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
 	openaiKey := os.Getenv("OPENAI_API_KEY")
 	ollamaModel := os.Getenv("OLLAMA_MODEL")
-
-	if anthropicKey == "" && openaiKey == "" && ollamaModel == "" {
-		return nil, fmt.Errorf("no API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY or OLLAMA_MODEL")
+	if ollamaModel == "" {
+		ollamaModel = "qwen2.5:latest"
 	}
 
 	var transcriptText strings.Builder
@@ -55,9 +54,6 @@ func Analyze(transcript *transcriber.Transcript) (*AnalysisResult, error) {
 		fmt.Println("    🧠 Using OpenAI...")
 		responseText, err = callOpenAI(openaiKey, prompt)
 	default:
-		if ollamaModel == "" {
-			ollamaModel = "qwen2.5:7b"
-		}
 		fmt.Printf("    🧠 Using Ollama (%s)...\n", ollamaModel)
 
 		truncated := truncateTranscript(transcriptText.String(), 12000)
