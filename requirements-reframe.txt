@@ -2,7 +2,9 @@
 opencv-python>=4.10
 numpy>=1.26,<3
 
-# GPU accelerated face tracking (InsightFace buffalo_l with CUDA for RTX 3050 / NVIDIA)
+# GPU accelerated face & object tracking (YOLOv8 + InsightFace buffalo_l with CUDA for RTX 3050 / NVIDIA)
 # Note: install onnxruntime-gpu (do NOT install cpu onnxruntime alongside it)
 insightface>=2.0
 onnxruntime-gpu>=1.20
+ultralytics>=8.0
+torch>=2.0

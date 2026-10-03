@@ -17,6 +17,7 @@ from pathlib import Path
 
 import cv2
 
+from camera_planner import IntelligentCameraPlanner
 from detector import SubjectDetector
 from face_tracker import FaceTracker
 from scene_detector import SceneCutDetector
@@ -232,7 +233,16 @@ def reframe(args: argparse.Namespace) -> None:
     detector = SubjectDetector(model_dir=args.model_dir, use_gpu=not args.cpu, det_size=args.det_size)
     print(f"[reframe] detector={detector.info.name} device={detector.info.device}", flush=True)
 
-    tracker = FaceTracker(frame_w, frame_h, crop_w, hold_seconds=args.hold_seconds)
+    planner = IntelligentCameraPlanner(
+        frame_width=frame_w,
+        frame_height=frame_h,
+        crop_width=crop_w,
+        crop_height=crop_h,
+        hold_seconds=args.hold_seconds,
+    )
+    if info.get("has_audio"):
+        planner.set_audio_path(args.input)
+
     smoother = TargetSmoother(frame_w, frame_h, crop_w, fps, refocus_band_fraction=args.refocus_band)
     crop_smoother = CropSmoother()
     scene = SceneCutDetector(threshold=args.scene_threshold)
@@ -252,17 +262,17 @@ def reframe(args: argparse.Namespace) -> None:
             if not ok:
                 break
             now = processed / fps
-            faces = detector.detect(frame)
-            if faces:
+            entities = detector.detect_entities(frame)
+            if entities:
                 detections += 1
-            target = tracker.update(faces, now)
+
             if scene.update(frame):
-                tracker.reset()
-                target = tracker.update(faces, now) or frame_center
+                planner.reset()
+                target = planner.update(frame, entities, now)
                 smoother.reset(target[0], target[1] + headroom_shift)
                 crop_smoother.reset()
-            elif target is None:
-                target = frame_center
+            else:
+                target = planner.update(frame, entities, now)
 
             sx, sy = smoother.update(target[0], target[1] + headroom_shift)
             left, top = _clamp_origin(sx, sy, crop_w, crop_h, frame_w, frame_h)
@@ -278,7 +288,7 @@ def reframe(args: argparse.Namespace) -> None:
         raise RuntimeError("no frames decoded")
 
     hit_rate = detections / processed
-    print(f"[reframe] faces/people on {detections}/{processed} frames ({hit_rate:.0%})", flush=True)
+    print(f"[reframe] subjects/objects on {detections}/{processed} frames ({hit_rate:.0%})", flush=True)
     if hit_rate < 0.02:
         print("[reframe] almost no subjects detected; using center crop path", flush=True)
         commands = [(t, (frame_w - crop_w) // 2, 0) for t, _, _ in commands]

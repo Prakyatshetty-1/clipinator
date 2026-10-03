@@ -1,18 +1,20 @@
-"""Local face/person detectors. No cloud APIs.
+"""Local multi-modal detectors for faces, persons, and objects. No cloud APIs.
 
 Priority:
-1. InsightFace buffalo_l (same family as vertical_video_convertor) if installed
-2. OpenCV YuNet (tiny ONNX, cached locally)
-3. Haar cascade fallback
-4. HOG pedestrians when no faces are found
+1. InsightFace buffalo_l (faces) + YOLOv8n (persons, food, props, objects)
+2. OpenCV YuNet (faces)
+3. Haar cascade fallback (faces)
+4. HOG pedestrians & salient foreground contours (objects/props fallback)
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import cv2
 import numpy as np
@@ -36,6 +38,28 @@ class DetectorInfo:
     device: str
 
 
+@dataclass
+class DetectedEntity:
+    bbox: list[float]  # [x1, y1, x2, y2]
+    category: str      # 'face', 'person', 'object'
+    label: str         # e.g. 'face', 'person', 'food', 'phone', 'money_prop', 'object'
+    score: float       # Confidence score (0.0 to 1.0)
+
+
+FOOD_CLASSES = {
+    "banana", "apple", "sandwich", "orange", "broccoli", "carrot",
+    "hot dog", "pizza", "donut", "cake", "bowl"
+}
+
+PROP_CLASSES = {
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon",
+    "backpack", "umbrella", "handbag", "tie", "suitcase",
+    "sports ball", "baseball bat", "baseball glove", "skateboard", "tennis racket",
+    "cell phone", "laptop", "mouse", "remote", "keyboard", "book", "clock",
+    "vase", "scissors", "teddy bear"
+}
+
+
 class SubjectDetector:
     def __init__(self, model_dir: str, use_gpu: bool = True, det_size: int = 640) -> None:
         self.model_dir = Path(model_dir)
@@ -47,8 +71,10 @@ class SubjectDetector:
         self._yunet_size: tuple[int, int] | None = None
         self._haar = None
         self._hog = None
+        self._yolo = None
         self.info = DetectorInfo(name="none", device="cpu")
         self._init_backend()
+        self._init_yolo()
 
     def _init_backend(self) -> None:
         if self._try_insightface():
@@ -59,6 +85,24 @@ class SubjectDetector:
         if os.path.exists(cascade):
             self._haar = cv2.CascadeClassifier(cascade)
             self.info = DetectorInfo(name="haar", device="cpu")
+
+    def _init_yolo(self) -> None:
+        try:
+            from ultralytics import YOLO
+            import torch
+
+            target_weights = self.model_dir / "yolov8n.pt"
+            local_weights = Path("yolov8n.pt")
+            if not target_weights.exists() and local_weights.exists():
+                try:
+                    shutil.copy(local_weights, target_weights)
+                except Exception:
+                    pass
+
+            weights_path = str(target_weights if target_weights.exists() else "yolov8n.pt")
+            self._yolo = YOLO(weights_path)
+        except Exception:
+            self._yolo = None
 
     def _try_insightface(self) -> bool:
         try:
@@ -141,7 +185,8 @@ class SubjectDetector:
             self._hog = hog
         return self._hog
 
-    def detect(self, frame: np.ndarray) -> list[DetectedFace]:
+    def detect_faces(self, frame: np.ndarray) -> list[DetectedFace]:
+        """Detects faces using InsightFace -> YuNet -> Haar cascade."""
         faces: list[DetectedFace] = []
         if self._insight is not None:
             try:
@@ -177,6 +222,11 @@ class SubjectDetector:
             for x, y, bw, bh in found:
                 faces.append(DetectedFace(bbox=[float(x), float(y), float(x + bw), float(y + bh)], det_score=1.0))
 
+        return faces
+
+    def detect(self, frame: np.ndarray) -> list[DetectedFace]:
+        """Backwards-compatible detect: returns faces or HOG pedestrian fallback."""
+        faces = self.detect_faces(frame)
         if faces:
             return faces
 
@@ -193,3 +243,165 @@ class SubjectDetector:
                 )
             )
         return people
+
+    def detect_entities(self, frame: np.ndarray) -> list[DetectedEntity]:
+        """Detects all visual entities in the frame: faces, persons, and objects."""
+        entities: list[DetectedEntity] = []
+
+        # 1. Faces
+        faces = self.detect_faces(frame)
+        for f in faces:
+            entities.append(
+                DetectedEntity(
+                    bbox=[float(v) for v in f.bbox[:4]],
+                    category="face",
+                    label="face",
+                    score=float(f.det_score),
+                )
+            )
+
+        # 2. Objects and Persons via YOLOv8
+        if self._yolo is not None:
+            try:
+                import torch
+                device = "cuda" if (self.use_gpu and torch.cuda.is_available()) else "cpu"
+                results = self._yolo.predict(frame, device=device, verbose=False, conf=0.25)
+                for res in results:
+                    boxes = res.boxes
+                    if boxes is None:
+                        continue
+                    for box in boxes:
+                        cls_id = int(box.cls[0].item())
+                        cls_name = res.names[cls_id]
+                        conf = float(box.conf[0].item())
+                        xyxy = [float(v) for v in box.xyxy[0].tolist()]
+
+                        if cls_name == "person":
+                            entities.append(
+                                DetectedEntity(
+                                    bbox=xyxy,
+                                    category="person",
+                                    label="person",
+                                    score=conf,
+                                )
+                            )
+                        elif cls_name in FOOD_CLASSES:
+                            entities.append(
+                                DetectedEntity(
+                                    bbox=xyxy,
+                                    category="object",
+                                    label="food",
+                                    score=conf,
+                                )
+                            )
+                        elif cls_name in PROP_CLASSES:
+                            entities.append(
+                                DetectedEntity(
+                                    bbox=xyxy,
+                                    category="object",
+                                    label=cls_name,
+                                    score=conf,
+                                )
+                            )
+                        else:
+                            entities.append(
+                                DetectedEntity(
+                                    bbox=xyxy,
+                                    category="object",
+                                    label=cls_name,
+                                    score=conf * 0.8,
+                                )
+                            )
+            except Exception:
+                pass
+
+        # 3. Fallback to HOG persons only if neither person nor face was detected
+        has_person = any(e.category == "person" for e in entities)
+        has_face = any(e.category == "face" for e in entities)
+        if not has_person and not has_face:
+            try:
+                h, w = frame.shape[:2]
+                scale = 640.0 / max(w, 1)
+                small = cv2.resize(frame, (640, int(h * scale)), interpolation=cv2.INTER_AREA)
+                rects, weights = self._hog_detector().detectMultiScale(small, winStride=(16, 16), padding=(8, 8), scale=1.1)
+                inv_scale = 1.0 / scale
+                for (x, y, bw, bh), weight in zip(rects, weights):
+                    score = float(weight[0] if hasattr(weight, "__len__") else weight)
+                    entities.append(
+                        DetectedEntity(
+                            bbox=[float(x * inv_scale), float(y * inv_scale), float((x + bw) * inv_scale), float((y + bh) * inv_scale)],
+                            category="person",
+                            label="person",
+                            score=max(0.5, score),
+                        )
+                    )
+            except Exception:
+                pass
+
+        # 4. Salient foreground objects / props (money, packages, items held in hands)
+        salient_objects = self._detect_salient_objects(frame, entities)
+        entities.extend(salient_objects)
+
+        return entities
+
+    def _detect_salient_objects(
+        self,
+        frame: np.ndarray,
+        existing: list[DetectedEntity],
+    ) -> list[DetectedEntity]:
+        """Finds prominent foreground objects not caught by standard COCO classes.
+        
+        Detects items like paper money, unboxed gifts, packages, or high-contrast props
+        held by or placed near subjects.
+        """
+        h, w = frame.shape[:2]
+        small = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+
+        # Contrast edges
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 3
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        scale_x = w / 320.0
+        scale_y = h / 180.0
+        frame_area = w * h
+
+        objects: list[DetectedEntity] = []
+        for cnt in contours:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            rx1, ry1, rx2, ry2 = x * scale_x, y * scale_y, (x + cw) * scale_x, (y + ch) * scale_y
+            area = (rx2 - rx1) * (ry2 - ry1)
+
+            # Looking for medium-sized props (between 1.5% and 25% of the frame)
+            if area < 0.015 * frame_area or area > 0.35 * frame_area:
+                continue
+
+            # Don't duplicate existing detected faces/persons
+            overlap = False
+            for ex in existing:
+                ex1, ey1, ex2, ey2 = ex.bbox
+                ix1, iy1 = max(rx1, ex1), max(ry1, ey1)
+                ix2, iy2 = min(rx2, ex2), min(ry2, ey2)
+                if ix2 > ix1 and iy2 > iy1:
+                    inter = (ix2 - ix1) * (iy2 - iy1)
+                    if inter / area > 0.6:
+                        overlap = True
+                        break
+            if not overlap:
+                objects.append(
+                    DetectedEntity(
+                        bbox=[rx1, ry1, rx2, ry2],
+                        category="object",
+                        label="prop",
+                        score=0.65,
+                    )
+                )
+
+        # Keep top 3 most prominent salient props
+        objects.sort(key=lambda o: (o.bbox[2] - o.bbox[0]) * (o.bbox[3] - o.bbox[1]), reverse=True)
+        return objects[:3]

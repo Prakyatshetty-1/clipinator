@@ -3,3 +3,6 @@
 bin/
 .envrc
 .DS_Store
+*.pt
+__pycache__/
+*.pyc
