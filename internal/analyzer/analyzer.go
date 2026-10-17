@@ -65,8 +65,33 @@ func Analyze(transcript *transcriber.Transcript) (*AnalysisResult, error) {
 	}
 
 	var result AnalysisResult
-	if err := json.Unmarshal([]byte(sanitizeJSON(responseText)), &result); err != nil {
-		return nil, fmt.Errorf("failed to parse clip suggestions: %w\nRaw: %s", err, responseText)
+	clean := sanitizeJSON(responseText)
+	if err := json.Unmarshal([]byte(clean), &result); err != nil || len(result.Clips) == 0 {
+		// Support multiple/line-delimited {"clips":[...]} objects from Ollama/Qwen
+		dec := json.NewDecoder(strings.NewReader(responseText))
+		var merged []Clip
+		for {
+			var partial struct {
+				Clips []Clip `json:"clips"`
+			}
+			if errDecode := dec.Decode(&partial); errDecode == nil {
+				if len(partial.Clips) > 0 {
+					merged = append(merged, partial.Clips...)
+				}
+				continue
+			}
+			break
+		}
+		if len(merged) > 0 {
+			result.Clips = merged
+		} else {
+			var arr []Clip
+			if errArr := json.Unmarshal([]byte(clean), &arr); errArr == nil && len(arr) > 0 {
+				result.Clips = arr
+			} else {
+				return nil, fmt.Errorf("failed to parse clip suggestions: %w\nRaw: %s", err, responseText)
+			}
+		}
 	}
 
 	result.Clips = validateClips(result.Clips, totalDuration)
@@ -90,8 +115,32 @@ TRANSCRIPT:
 			return nil, fmt.Errorf("retry failed: %w", err)
 		}
 
-		if err := json.Unmarshal([]byte(sanitizeJSON(responseText)), &result); err != nil {
-			return nil, fmt.Errorf("failed to parse retry: %w\nRaw: %s", err, responseText)
+		cleanRetry := sanitizeJSON(responseText)
+		if err := json.Unmarshal([]byte(cleanRetry), &result); err != nil || len(result.Clips) == 0 {
+			dec := json.NewDecoder(strings.NewReader(responseText))
+			var merged []Clip
+			for {
+				var partial struct {
+					Clips []Clip `json:"clips"`
+				}
+				if errDecode := dec.Decode(&partial); errDecode == nil {
+					if len(partial.Clips) > 0 {
+						merged = append(merged, partial.Clips...)
+					}
+					continue
+				}
+				break
+			}
+			if len(merged) > 0 {
+				result.Clips = merged
+			} else {
+				var arr []Clip
+				if errArr := json.Unmarshal([]byte(cleanRetry), &arr); errArr == nil && len(arr) > 0 {
+					result.Clips = arr
+				} else {
+					return nil, fmt.Errorf("failed to parse retry: %w\nRaw: %s", err, responseText)
+				}
+			}
 		}
 
 		result.Clips = validateClips(result.Clips, totalDuration)

@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """Smart 9:16 reframer for Clipreator.
 
-Tracks faces/people, eases the crop like a camera, snaps on scene cuts,
-then encodes once with ffmpeg so the source audio can be stream-copied.
+Features:
+- Tracks faces, people, and objects with persistent IDs across frames.
+- Spoken context & object grounding using faster-whisper transcripts.
+- Active speaker detection combining Whisper VAD timestamps + mouth dynamics.
+- Weighted context-aware candidate selection with dwell-time and hysteresis.
+- Scene-cut detection and tracking reset.
+- Fast sampling with intermediate track velocity projection.
+- Smooth camera easing with dead-zone and boundary clamping.
+- Debug mode with visual overlay and decision logs.
 """
 
 from __future__ import annotations
@@ -16,10 +23,10 @@ import tempfile
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from camera_planner import IntelligentCameraPlanner
-from detector import SubjectDetector
-from face_tracker import FaceTracker
+from detector import DetectedEntity, SubjectDetector
 from scene_detector import SceneCutDetector
 from smoothing import CropSmoother, TargetSmoother
 
@@ -73,8 +80,8 @@ def _probe(path: str) -> dict:
 def _clamp_origin(cx: float, cy: float, crop_w: int, crop_h: int, frame_w: int, frame_h: int) -> tuple[int, int]:
     left = cx - crop_w / 2.0
     top = cy - crop_h / 2.0
-    left = min(max(left, 0.0), float(frame_w - crop_w))
-    top = min(max(top, 0.0), float(frame_h - crop_h))
+    left = min(max(left, 0.0), float(max(0, frame_w - crop_w)))
+    top = min(max(top, 0.0), float(max(0, frame_h - crop_h)))
     return int(round(left)), int(round(top))
 
 
@@ -176,7 +183,15 @@ def _render_cv2(
         writer.release()
 
 
-def _mux_scaled(temp_video: Path, source: str, output_path: str, out_w: int, out_h: int, has_audio: bool, use_gpu: bool = True) -> None:
+def _mux_scaled(
+    temp_video: Path,
+    source: str,
+    output_path: str,
+    out_w: int,
+    out_h: int,
+    has_audio: bool,
+    use_gpu: bool = True,
+) -> None:
     vf = f"scale={out_w}:{out_h}"
     for enc in _video_encoders(use_gpu):
         if has_audio:
@@ -207,11 +222,23 @@ def _mux_scaled(temp_video: Path, source: str, output_path: str, out_w: int, out
 def reframe(args: argparse.Namespace) -> None:
     info = _probe(args.input)
     frame_w, frame_h, fps = info["width"], info["height"], info["fps"]
-    crop_h = _even(frame_h)
-    crop_w = _even(crop_h * 9 / 16)
     use_gpu = not args.cpu
-    if crop_w > frame_w:
-        # Already vertical / too narrow: scale only.
+
+    # 1. Exact 9:16 aspect ratio geometry
+    target_aspect = args.width / float(args.height)  # 1080 / 1920 = 0.5625
+    source_aspect = frame_w / float(frame_h)
+
+    if source_aspect >= target_aspect:
+        # Landscape or wide video: crop height spans full source height
+        crop_h = _even(frame_h)
+        crop_w = _even(crop_h * target_aspect)
+    else:
+        # Narrow / vertical video: crop width spans full source width
+        crop_w = _even(frame_w)
+        crop_h = _even(crop_w / target_aspect)
+
+    if crop_w >= frame_w and crop_h >= frame_h:
+        # Already vertical / exact target aspect: scale directly
         vf = f"scale={args.width}:{args.height}:force_original_aspect_ratio=increase,crop={args.width}:{args.height}"
         for enc in _video_encoders(use_gpu):
             cmd = [
@@ -221,17 +248,11 @@ def reframe(args: argparse.Namespace) -> None:
             if _run_ffmpeg(cmd).returncode == 0:
                 print("[reframe] source already vertical; scaled to target 9:16", flush=True)
                 return
-            cmd = [
-                "ffmpeg", "-y", "-i", args.input, "-vf", vf, *enc,
-                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", args.output,
-            ]
-            if _run_ffmpeg(cmd).returncode == 0:
-                print("[reframe] source already vertical; scaled to target 9:16", flush=True)
-                return
         raise RuntimeError("ffmpeg scale failed")
 
-    detector = SubjectDetector(model_dir=args.model_dir, use_gpu=not args.cpu, det_size=args.det_size)
-    print(f"[reframe] detector={detector.info.name} device={detector.info.device}", flush=True)
+    # 2. Initialize Detectors, Trackers & Planner
+    detector = SubjectDetector(model_dir=args.model_dir, use_gpu=use_gpu, det_size=args.det_size)
+    print(f"[reframe] detector={detector.info.name} device={detector.info.device} yolo={detector.info.yolo_loaded}", flush=True)
 
     planner = IntelligentCameraPlanner(
         frame_width=frame_w,
@@ -239,6 +260,7 @@ def reframe(args: argparse.Namespace) -> None:
         crop_width=crop_w,
         crop_height=crop_h,
         hold_seconds=args.hold_seconds,
+        context_path=args.context,
     )
     if info.get("has_audio"):
         planner.set_audio_path(args.input)
@@ -247,52 +269,91 @@ def reframe(args: argparse.Namespace) -> None:
     crop_smoother = CropSmoother()
     scene = SceneCutDetector(threshold=args.scene_threshold)
     headroom_shift = (0.5 - args.headroom) * crop_h
-    frame_center = (frame_w / 2.0, frame_h / 2.0)
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
         raise RuntimeError(f"could not open {args.input}")
 
     commands: list[tuple[float, int, int]] = []
-    detections = 0
+    detections_count = 0
     processed = 0
+    sample_interval = max(1, args.sample_interval)
+
+    # Optional debug video writer
+    debug_writer = None
+    if args.debug:
+        debug_out_path = str(Path(args.output).with_suffix(".debug.mp4"))
+        debug_writer = cv2.VideoWriter(debug_out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_w, frame_h))
+        print(f"[reframe-debug] writing visual diagnostics to {debug_out_path}", flush=True)
+
+    cached_entities: list[DetectedEntity] = []
+
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             now = processed / fps
-            entities = detector.detect_entities(frame)
-            if entities:
-                detections += 1
 
-            if scene.update(frame):
+            is_scene_cut = scene.update(frame)
+            if is_scene_cut:
                 planner.reset()
-                target = planner.update(frame, entities, now)
+                smoother.reset(frame_w / 2.0, frame_h / 2.0)
+                crop_smoother.reset()
+
+            # Keyframe sampling: run full neural detector on interval or scene cut
+            if is_scene_cut or (processed % sample_interval == 0) or not cached_entities:
+                cached_entities = detector.detect_entities(frame)
+                if cached_entities:
+                    detections_count += 1
+
+            target = planner.update(frame, cached_entities, now)
+
+            if is_scene_cut:
                 smoother.reset(target[0], target[1] + headroom_shift)
                 crop_smoother.reset()
-            else:
-                target = planner.update(frame, entities, now)
 
             sx, sy = smoother.update(target[0], target[1] + headroom_shift)
             left, top = _clamp_origin(sx, sy, crop_w, crop_h, frame_w, frame_h)
             left, top = crop_smoother.update(left, top)
             commands.append((now, left, top))
+
+            # Debug visual overlay
+            if debug_writer is not None:
+                dbg_frame = frame.copy()
+                # 1. Draw entities
+                for t in planner.tracker.tracks.values():
+                    bx1, by1, bx2, by2 = [int(v) for v in t.bbox]
+                    color = (0, 255, 0) if t.is_active_speaker else (255, 200, 0) if t.category == "object" else (255, 120, 0)
+                    cv2.rectangle(dbg_frame, (bx1, by1), (bx2, by2), color, 2)
+                    label_str = f"#{t.track_id} {t.label}"
+                    if t.speaker_score > 0.2:
+                        label_str += f" spk:{t.speaker_score:.2f}"
+                    cv2.putText(dbg_frame, label_str, (bx1, max(15, by1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+                # 2. Draw 9:16 crop rectangle
+                cv2.rectangle(dbg_frame, (left, top), (left + crop_w, top + crop_h), (0, 0, 255), 3)
+                # 3. Draw diagnostic text
+                target_cand = planner._last_selected_candidate
+                tgt_info = f"t={now:.2f}s | Target: {target_cand.id if target_cand else 'center'} ({target_cand.reason if target_cand else ''})"
+                cv2.putText(dbg_frame, tgt_info, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+                debug_writer.write(dbg_frame)
+
             processed += 1
             if processed % 60 == 0:
                 print(f"[reframe] analyzed {processed} frames", flush=True)
     finally:
         cap.release()
+        if debug_writer is not None:
+            debug_writer.release()
 
     if processed == 0:
         raise RuntimeError("no frames decoded")
 
-    hit_rate = detections / processed
-    print(f"[reframe] subjects/objects on {detections}/{processed} frames ({hit_rate:.0%})", flush=True)
-    if hit_rate < 0.02:
-        print("[reframe] almost no subjects detected; using center crop path", flush=True)
-        commands = [(t, (frame_w - crop_w) // 2, 0) for t, _, _ in commands]
+    hit_rate = detections_count / max(1, processed // sample_interval)
+    print(f"[reframe] detected subjects on {detections_count} sampled frames ({hit_rate:.0%})", flush=True)
 
+    # 3. Output encoding
     out_parent = Path(args.output).resolve().parent
     out_parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="clipreator_reframe_", dir=str(out_parent)) as tmp:
@@ -312,7 +373,7 @@ def reframe(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Smart 9:16 reframe a landscape clip")
+    parser = argparse.ArgumentParser(description="Smart 9:16 context-aware vertical reframer")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--width", type=int, default=1080)
@@ -322,6 +383,9 @@ def main() -> int:
     parser.add_argument("--scene-threshold", type=float, default=28.0)
     parser.add_argument("--refocus-band", type=float, default=0.03)
     parser.add_argument("--det-size", type=int, default=640)
+    parser.add_argument("--sample-interval", type=int, default=4, help="Keyframe detection interval in frames (default 4)")
+    parser.add_argument("--context", default=None, help="Path to clip transcript and highlight context JSON")
+    parser.add_argument("--debug", action="store_true", help="Generate annotated diagnostic video with bounding boxes and crop window")
     parser.add_argument("--model-dir", default=os.path.expanduser("~/.clipreator/models"))
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()

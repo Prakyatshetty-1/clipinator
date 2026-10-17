@@ -16,15 +16,17 @@ import (
 var scriptFS embed.FS
 
 type Options struct {
-	Mode       string
-	Width      int
-	Height     int
-	RefocusBand float64
-	HoldSeconds float64
+	Mode           string
+	Width          int
+	Height         int
+	RefocusBand    float64
+	HoldSeconds    float64
 	SceneThreshold float64
-	Headroom   float64
-	CPU        bool
-	WorkDir    string
+	Headroom       float64
+	CPU            bool
+	WorkDir        string
+	ContextPath    string
+	Debug          bool
 }
 
 func DefaultOptions() Options {
@@ -37,6 +39,7 @@ func DefaultOptions() Options {
 		SceneThreshold: 28.0,
 		Headroom:       0.42,
 		CPU:            os.Getenv("CLIPREATOR_REFRAME_CPU") == "1",
+		Debug:          os.Getenv("CLIPREATOR_DEBUG_REFRAME") == "1",
 	}
 }
 
@@ -64,6 +67,25 @@ func pythonBin() string {
 		}
 	}
 	return "python3"
+}
+
+func findScriptDir(workDir string) (string, error) {
+	candidates := []string{
+		filepath.Join("internal", "reframer", "scripts"),
+		filepath.Join("..", "internal", "reframer", "scripts"),
+		filepath.Join("../..", "internal", "reframer", "scripts"),
+	}
+	for _, c := range candidates {
+		target := filepath.Join(c, "reframe.py")
+		if info, err := os.Stat(target); err == nil && !info.IsDir() {
+			if abs, err := filepath.Abs(c); err == nil {
+				return abs, nil
+			}
+			return c, nil
+		}
+	}
+	scriptDir := filepath.Join(workDir, "reframe_scripts")
+	return extractScripts(scriptDir)
 }
 
 func extractScripts(dest string) (string, error) {
@@ -105,6 +127,9 @@ func Reframe(inputPath string, opts Options) error {
 		mode = "auto"
 	}
 
+	if abs, err := filepath.Abs(inputPath); err == nil {
+		inputPath = abs
+	}
 	tmpOut := inputPath + ".reframe.mp4"
 	defer os.Remove(tmpOut)
 
@@ -115,9 +140,9 @@ func Reframe(inputPath string, opts Options) error {
 		return replaceFile(tmpOut, inputPath)
 	}
 
-	scriptDir := filepath.Join(opts.WorkDir, "reframe_scripts")
-	if _, err := extractScripts(scriptDir); err != nil {
-		fmt.Printf("    ⚠️  Could not extract reframe scripts (%v); using center crop\n", err)
+	scriptDir, err := findScriptDir(opts.WorkDir)
+	if err != nil {
+		fmt.Printf("    ⚠️  Could not locate reframe scripts (%v); using center crop\n", err)
 		if err := CenterCrop(inputPath, tmpOut, opts.Width, opts.Height); err != nil {
 			return err
 		}
@@ -144,6 +169,12 @@ func Reframe(inputPath string, opts Options) error {
 	}
 	if opts.CPU {
 		args = append(args, "--cpu")
+	}
+	if opts.ContextPath != "" {
+		args = append(args, "--context", opts.ContextPath)
+	}
+	if opts.Debug {
+		args = append(args, "--debug")
 	}
 
 	cmd := exec.Command(pythonBin(), args...)

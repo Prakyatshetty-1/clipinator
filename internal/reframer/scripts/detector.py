@@ -1,7 +1,7 @@
 """Local multi-modal detectors for faces, persons, and objects. No cloud APIs.
 
 Priority:
-1. InsightFace buffalo_l (faces) + YOLOv8n (persons, food, props, objects)
+1. InsightFace buffalo_l (faces) + YOLOv8n (persons, food, props, objects) on GPU
 2. OpenCV YuNet (faces)
 3. Haar cascade fallback (faces)
 4. HOG pedestrians & salient foreground contours (objects/props fallback)
@@ -9,8 +9,12 @@ Priority:
 
 from __future__ import annotations
 
+import ctypes
+import glob
 import os
 import shutil
+import site
+import sys
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +22,33 @@ from typing import Sequence
 
 import cv2
 import numpy as np
+
+
+def _setup_cuda_library_paths():
+    """Auto-detect and preload NVIDIA CUDA shared libraries for GPU runtime."""
+    try:
+        sitepkgs = site.getsitepackages()
+    except Exception:
+        sitepkgs = []
+
+    for sp in sitepkgs:
+        nv_root = os.path.join(sp, "nvidia")
+        if os.path.isdir(nv_root):
+            for libname in [
+                "libcudart.so.12", "libcudart.so.13",
+                "libcublasLt.so.12", "libcublasLt.so.13",
+                "libcublas.so.12", "libcublas.so.13",
+                "libcurand.so.10",
+            ]:
+                matches = glob.glob(os.path.join(nv_root, "**", libname), recursive=True)
+                for m in matches:
+                    try:
+                        ctypes.CDLL(m, ctypes.RTLD_GLOBAL)
+                    except Exception:
+                        pass
+
+
+_setup_cuda_library_paths()
 
 from face_tracker import DetectedFace
 
@@ -36,13 +67,14 @@ def _even(value: int) -> int:
 class DetectorInfo:
     name: str
     device: str
+    yolo_loaded: bool = False
 
 
 @dataclass
 class DetectedEntity:
     bbox: list[float]  # [x1, y1, x2, y2]
     category: str      # 'face', 'person', 'object'
-    label: str         # e.g. 'face', 'person', 'food', 'phone', 'money_prop', 'object'
+    label: str         # e.g. 'face', 'person', 'food', 'cell phone', 'laptop', 'prop'
     score: float       # Confidence score (0.0 to 1.0)
 
 
@@ -59,6 +91,8 @@ PROP_CLASSES = {
     "vase", "scissors", "teddy bear"
 }
 
+VEHICLE_CLASSES = {"car", "motorcycle", "bicycle", "bus", "train", "truck", "boat"}
+
 
 class SubjectDetector:
     def __init__(self, model_dir: str, use_gpu: bool = True, det_size: int = 640) -> None:
@@ -72,7 +106,7 @@ class SubjectDetector:
         self._haar = None
         self._hog = None
         self._yolo = None
-        self.info = DetectorInfo(name="none", device="cpu")
+        self.info = DetectorInfo(name="none", device="cpu", yolo_loaded=False)
         self._init_backend()
         self._init_yolo()
 
@@ -84,7 +118,7 @@ class SubjectDetector:
         cascade = getattr(cv2.data, "haarcascades", "") + "haarcascade_frontalface_default.xml"
         if os.path.exists(cascade):
             self._haar = cv2.CascadeClassifier(cascade)
-            self.info = DetectorInfo(name="haar", device="cpu")
+            self.info = DetectorInfo(name="haar", device="cpu", yolo_loaded=False)
 
     def _init_yolo(self) -> None:
         try:
@@ -101,8 +135,10 @@ class SubjectDetector:
 
             weights_path = str(target_weights if target_weights.exists() else "yolov8n.pt")
             self._yolo = YOLO(weights_path)
+            self.info.yolo_loaded = True
         except Exception:
             self._yolo = None
+            self.info.yolo_loaded = False
 
     def _try_insightface(self) -> bool:
         try:
@@ -126,10 +162,9 @@ class SubjectDetector:
             app = FaceAnalysis(name="buffalo_l", allowed_modules=["detection"], providers=providers)
             app.prepare(ctx_id=0 if device == "cuda" else -1, det_size=(self.det_size, self.det_size))
             self._insight = app
-            self.info = DetectorInfo(name="insightface", device=device)
+            self.info = DetectorInfo(name="insightface", device=device, yolo_loaded=self.info.yolo_loaded)
             return True
         except Exception as exc:
-            print(f"[reframe] InsightFace unavailable ({exc}); trying YuNet", flush=True)
             return False
 
     def _try_yunet(self) -> bool:
@@ -140,7 +175,6 @@ class SubjectDetector:
                     model_path.unlink()
                 except OSError:
                     pass
-            print(f"[reframe] Downloading YuNet face model to {model_path} ...", flush=True)
             downloaded = False
             try:
                 import subprocess
@@ -160,8 +194,7 @@ class SubjectDetector:
                         f.write(resp.read())
                     if model_path.stat().st_size >= 50000:
                         downloaded = True
-                except Exception as exc:
-                    print(f"[reframe] YuNet download failed: {exc}", flush=True)
+                except Exception:
                     if model_path.exists():
                         try:
                             model_path.unlink()
@@ -172,10 +205,9 @@ class SubjectDetector:
         try:
             detector = cv2.FaceDetectorYN.create(str(model_path), "", (320, 320), 0.6, 0.3, 5000)
             self._yunet = detector
-            self.info = DetectorInfo(name="yunet", device="cpu")
+            self.info = DetectorInfo(name="yunet", device="cpu", yolo_loaded=self.info.yolo_loaded)
             return True
-        except Exception as exc:
-            print(f"[reframe] YuNet init failed: {exc}", flush=True)
+        except Exception:
             return False
 
     def _hog_detector(self):
@@ -187,6 +219,9 @@ class SubjectDetector:
 
     def detect_faces(self, frame: np.ndarray) -> list[DetectedFace]:
         """Detects faces using InsightFace -> YuNet -> Haar cascade."""
+        if frame is None or frame.size == 0:
+            return []
+
         faces: list[DetectedFace] = []
         if self._insight is not None:
             try:
@@ -246,6 +281,9 @@ class SubjectDetector:
 
     def detect_entities(self, frame: np.ndarray) -> list[DetectedEntity]:
         """Detects all visual entities in the frame: faces, persons, and objects."""
+        if frame is None or frame.size == 0:
+            return []
+
         entities: list[DetectedEntity] = []
 
         # 1. Faces
@@ -303,13 +341,22 @@ class SubjectDetector:
                                     score=conf,
                                 )
                             )
+                        elif cls_name in VEHICLE_CLASSES:
+                            entities.append(
+                                DetectedEntity(
+                                    bbox=xyxy,
+                                    category="object",
+                                    label=cls_name,
+                                    score=conf,
+                                )
+                            )
                         else:
                             entities.append(
                                 DetectedEntity(
                                     bbox=xyxy,
                                     category="object",
                                     label=cls_name,
-                                    score=conf * 0.8,
+                                    score=conf * 0.85,
                                 )
                             )
             except Exception:
@@ -349,11 +396,7 @@ class SubjectDetector:
         frame: np.ndarray,
         existing: list[DetectedEntity],
     ) -> list[DetectedEntity]:
-        """Finds prominent foreground objects not caught by standard COCO classes.
-        
-        Detects items like paper money, unboxed gifts, packages, or high-contrast props
-        held by or placed near subjects.
-        """
+        """Finds prominent foreground objects not caught by standard COCO classes."""
         h, w = frame.shape[:2]
         small = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
@@ -377,7 +420,7 @@ class SubjectDetector:
             rx1, ry1, rx2, ry2 = x * scale_x, y * scale_y, (x + cw) * scale_x, (y + ch) * scale_y
             area = (rx2 - rx1) * (ry2 - ry1)
 
-            # Looking for medium-sized props (between 1.5% and 25% of the frame)
+            # Looking for medium-sized props (between 1.5% and 35% of the frame)
             if area < 0.015 * frame_area or area > 0.35 * frame_area:
                 continue
 

@@ -105,6 +105,10 @@ func detectSilence(videoPath string) ([]silentSegment, error) {
 	return segments, nil
 }
 
+func VideoDuration(videoPath string) (float64, error) {
+	return getVideoDuration(videoPath)
+}
+
 func getVideoDuration(videoPath string) (float64, error) {
 	cmd := exec.Command("ffprobe",
 		"-v", "error",

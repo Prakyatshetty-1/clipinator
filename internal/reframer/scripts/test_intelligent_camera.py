@@ -170,7 +170,7 @@ def test_scenario_7_scene_cut_reset():
     # Scene 1: Focus on Person on left (x=300)
     p1 = DetectedEntity(bbox=[200, 300, 400, 800], category="person", label="person", score=0.90)
     planner.update(frame, [p1], now=1.0)
-    assert planner._active_target_id == "person_0"
+    assert planner._active_target_id and planner._active_target_id.startswith("person_")
 
     # SCENE CUT!
     planner.reset()

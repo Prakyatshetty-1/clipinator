@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/Verifieddanny/clipreator-cli/internal/captioner"
 	"github.com/Verifieddanny/clipreator-cli/internal/cutter"
 	"github.com/Verifieddanny/clipreator-cli/internal/reframer"
+	"github.com/Verifieddanny/clipreator-cli/internal/server"
 	"github.com/Verifieddanny/clipreator-cli/internal/transcriber"
 )
 
@@ -23,6 +25,9 @@ func main() {
 	var reframeHeight int
 	var reframeSmoothing float64
 	var ollamaModel string
+	var debugReframe bool
+	var serve bool
+	var port int
 
 	flag.StringVar(&url, "url", "", "YouTube URL to process")
 	flag.BoolVar(&reframeEnabled, "reframe", true, "enable smart 9:16 face-tracked reframing (default true)")
@@ -31,11 +36,29 @@ func main() {
 	flag.IntVar(&reframeWidth, "reframe-width", 1080, "vertical output width")
 	flag.IntVar(&reframeHeight, "reframe-height", 1920, "vertical output height")
 	flag.Float64Var(&reframeSmoothing, "reframe-smoothing", 0.03, "camera refocus band as a fraction of frame width (larger = calmer)")
+	flag.BoolVar(&debugReframe, "debug-reframe", false, "output diagnostic tracking logs and annotated frames")
 	flag.StringVar(&ollamaModel, "ollama-model", "", "Ollama model name (defaults to qwen2.5:latest)")
+	flag.BoolVar(&serve, "serve", false, "start HTTP API server for the React frontend")
+	flag.IntVar(&port, "port", 8080, "HTTP API server port (default 8080)")
 	flag.Parse()
 
+	if serve {
+		workDir := ".clipreator_tmp"
+		s := &server.Server{
+			Root:    server.FindRepoRoot(),
+			WorkDir: workDir,
+		}
+		addr := fmt.Sprintf(":%d", port)
+		fmt.Printf("🚀 Clipreator API server running on http://localhost:%d\n", port)
+		if err := http.ListenAndServe(addr, s.Handler()); err != nil {
+			fmt.Printf("Server failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if url == "" {
-		fmt.Println("URL is required")
+		fmt.Println("URL is required (or run with -serve to start the web backend)")
 		os.Exit(1)
 	}
 
@@ -132,6 +155,20 @@ func main() {
 			label = "center crop"
 		}
 		fmt.Printf("  🎥 Clip %d (%s)...\n", i+1, label)
+
+		clip := analyzer.Clip{}
+		if i < len(result.Clips) {
+			clip = result.Clips[i]
+		}
+		words := captioner.ExtractWords(transcript, clip.Start, clip.End)
+		words = captioner.RemapWords(words, clipResult.KeptSegments)
+
+		contextData := fmt.Sprintf(`{"title":%q,"hook":%q,"why":%q,"start":%f,"end":%f}`, clip.Title, clip.Hook, clip.Why, clip.Start, clip.End)
+		ctxPath := filepath.Join(workDir, fmt.Sprintf("clip_%d_context.json", i+1))
+		_ = os.WriteFile(ctxPath, []byte(contextData), 0644)
+		reframeOpts.ContextPath = ctxPath
+		reframeOpts.Debug = debugReframe
+
 		if err := reframer.Reframe(clipResult.Path, reframeOpts); err != nil {
 			fmt.Printf("    ⚠️  Reframe failed: %v\n", err)
 			continue

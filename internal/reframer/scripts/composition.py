@@ -45,6 +45,9 @@ class CompositionAnalyzer:
         small = cv2.resize(frame_bgr, self.FLOW_DOWNSCALE, interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
+        if np.max(gray) == 0:
+            return self.current_motion
+
         if self._prev_gray is None:
             self._prev_gray = gray
             self.current_motion = CameraMotion()
